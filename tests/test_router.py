@@ -155,7 +155,8 @@ def test_space_per_chat_mode():
     }
     assert router.handle_gchat_event(reply_event) == "forwarded_to_telegram"
     tg.send_message.assert_called_with(777, "Решаем вопрос")
-   
+
+
 def test_bridge_mode_1_to_1_without_threads():
     db = StateDB(":memory:")
     tg = MagicMock()

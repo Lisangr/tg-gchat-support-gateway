@@ -2,6 +2,16 @@ name: CD - Deploy Gateway
 
 on:
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Docker image tag to deploy (e.g. latest or sha-xxxxxxx)"
+        required: true
+        default: "latest"
+        type: string
+
+permissions:
+  contents: read
+  packages: read
 
 jobs:
   deploy:
@@ -9,46 +19,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare directories on Host
+      - name: Prepare target directory
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
+            set -euo pipefail
             mkdir -p /opt/support-gateway/secrets /opt/support-gateway/data
 
-      - name: Copy project files to Host
+      - name: Copy docker-compose.yml to host
         uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
-          overwrite: true
-          source: "src,Dockerfile,docker-compose.yml,requirements.txt"
-          target: "/opt/support-gateway"
+          source: "docker-compose.yml"
+          target: "/opt/support-gateway/"
 
-      - name: Write secrets & start container
+      - name: Pull GHCR image and restart service
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
-            set -e
+            set -euo pipefail
             cd /opt/support-gateway
 
-            cat <<'SA_EOF' > secrets/google-sa.json
+            umask 077
+            cat <<'EOF_SA' > secrets/google-sa.json
             ${{ secrets.GOOGLE_SA_KEY_JSON }}
-            SA_EOF
-            chmod 600 secrets/google-sa.json
+            EOF_SA
 
-            cat <<EOF > .env
+            cat <<'EOF_ENV' > .env
             TG_BOT_TOKEN=${{ secrets.TG_BOT_TOKEN }}
-            TG_CHAT_ID=${{ secrets.TG_CHAT_ID }}
             GCHAT_SPACE_ID=${{ secrets.GCHAT_SPACE_ID }}
+            TG_CHAT_ID=${{ secrets.TG_CHAT_ID }}
+            ROUTING_MODE=${{ secrets.ROUTING_MODE }}
             PUBSUB_SUBSCRIPTION=${{ secrets.PUBSUB_SUBSCRIPTION }}
-            EOF
+            EOF_ENV
+
+            chmod 700 secrets
+            chmod 644 secrets/google-sa.json
             chmod 600 .env
 
-            docker compose up -d --build
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+            export IMAGE_NAME="ghcr.io/${{ github.repository }}"
+            export IMAGE_TAG="${{ inputs.image_tag }}"
+
+            docker compose pull
+            docker compose up -d --no-build --remove-orphans
+            docker image prune -f
+            

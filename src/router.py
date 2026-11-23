@@ -1,4 +1,6 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+from src.metrics import MESSAGES_TOTAL
 from src.state_db import StateDB
 
 
@@ -8,16 +10,25 @@ class GatewayRouter:
         db: StateDB,
         tg_client: Any,
         gchat_client: Any,
+        routing_mode: str = "thread",
+        operator_emails: Tuple[str, ...] = (),
+        tg_chat_id: Optional[int] = None,
         gchat_space_id: str = "",
-        target_tg_chat_id: Optional[int] = None,
     ):
         self.db = db
         self.tg = tg_client
         self.gchat = gchat_client
+        self.routing_mode = routing_mode
+        self.operator_emails = operator_emails
+        self.tg_chat_id = tg_chat_id
         self.gchat_space_id = gchat_space_id
-        self.target_tg_chat_id = target_tg_chat_id
 
     def handle_telegram_update(self, update: Dict[str, Any]) -> str:
+        result = self._process_telegram_update(update)
+        MESSAGES_TOTAL.labels(direction="tg_to_gchat", outcome=result).inc()
+        return result
+
+    def _process_telegram_update(self, update: Dict[str, Any]) -> str:
         update_id = update.get("update_id")
         msg = update.get("message")
         if not msg:
@@ -27,75 +38,130 @@ class GatewayRouter:
         if sender.get("is_bot"):
             return "ignored_bot"
 
-        tg_chat_id = msg["chat"]["id"]
-        if self.target_tg_chat_id is not None and tg_chat_id != self.target_tg_chat_id:
-            return "ignored_wrong_chat"
-
         msg_uid = f"tg:{update_id}"
         if self.db.is_processed(msg_uid):
             return "ignored_duplicate"
 
+        tg_chat_id = msg["chat"]["id"]
+        if self.routing_mode == "bridge" and self.tg_chat_id is not None:
+            if tg_chat_id != self.tg_chat_id:
+                return "ignored_foreign_chat"
+
         username = sender.get("username") or sender.get("first_name") or str(tg_chat_id)
         text = msg.get("text") or "[Вложение / медиафайл]"
+        formatted = f"@{username} (ID: {tg_chat_id}):\n{text}"
 
-        if self.gchat_space_id:
-            self.db.bind_space(self.gchat_space_id, tg_chat_id)
+        if self.routing_mode == "bridge":
+            # Send straight to the Space main chat without thread/threadKey
+            self.gchat.send_message(text=formatted)
+        elif self.routing_mode == "space":
+            space_name = self.db.get_thread_by_tg(tg_chat_id)
+            if not space_name:
+                space_name = self.gchat.create_space(
+                    display_name=f"TG: @{username} ({tg_chat_id})",
+                    operator_emails=self.operator_emails,
+                )
+                self.db.upsert_thread(tg_chat_id, space_name)
+                self.gchat.send_message(
+                    text=f"[Новое обращение] {formatted}",
+                    space_name=space_name,
+                )
+            else:
+                self.gchat.send_message(text=formatted, space_name=space_name)
+        else:
+            thread_name = self.db.get_thread_by_tg(tg_chat_id)
+            if thread_name:
+                self.gchat.send_message(text=formatted, thread_name=thread_name)
+            else:
+                resp = self.gchat.send_message(
+                    text=f"[Новое обращение] {formatted}",
+                    thread_key=f"tg-{tg_chat_id}",
+                )
+                new_thread = resp.get("thread", {}).get("name")
+                if new_thread:
+                    self.db.upsert_thread(tg_chat_id, new_thread)
 
-        # Пишем напрямую в общий чат Google Chat без треда
-        self.gchat.send_message(text=f"@{username}: {text}")
         self.db.mark_processed(msg_uid)
         return "forwarded_to_gchat"
 
     def handle_gchat_event(self, event: Dict[str, Any]) -> str:
-        chat_payload = event.get("chat", {})
-        if "messagePayload" in chat_payload:
-            payload_obj = chat_payload["messagePayload"]
-            message = payload_obj.get("message", {})
-            space_name = (
-                payload_obj.get("space", {}).get("name")
-                or message.get("space", {}).get("name")
-            )
-        else:
-            message = event.get("message", event)
-            space_name = (
-                event.get("space", {}).get("name")
-                or message.get("space", {}).get("name")
-            )
+        result = self._process_gchat_event(event)
+        MESSAGES_TOTAL.labels(direction="gchat_to_tg", outcome=result).inc()
+        return result
 
+    @staticmethod
+    def _extract_gchat_message(event: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+        chat_obj = event.get("chat", {})
+        msg_payload = chat_obj.get("messagePayload", {})
+        if isinstance(msg_payload, dict) and msg_payload.get("message"):
+            message = msg_payload["message"]
+            space_name = (
+                message.get("space", {}).get("name")
+                or msg_payload.get("space", {}).get("name")
+                or ""
+            )
+            return message, space_name
+
+        message = event.get("message", event)
+        space_name = (
+            message.get("space", {}).get("name")
+            or event.get("space", {}).get("name")
+            or ""
+        )
+        return message, space_name
+
+    def _process_gchat_event(self, event: Dict[str, Any]) -> str:
+        message, space_name = self._extract_gchat_message(event)
         msg_name = message.get("name", "")
         sender_type = message.get("sender", {}).get("type", "")
 
-        # Anti-Echo: игнорируем сообщения от самого бота
+        # Anti-Echo: drop messages generated by the Chat bot itself
         if sender_type == "BOT":
             return "ignored_anti_echo"
 
         if msg_name and self.db.is_processed(f"gc:{msg_name}"):
             return "ignored_duplicate"
 
-        # argumentText содержит чистый текст без "@Support Gateway Bot"
-        if "argumentText" in message:
-            text = (message.get("argumentText") or "").strip()
-        else:
-            text = (message.get("text") or "").strip()
+        text = (message.get("argumentText") or message.get("text") or "").strip()
+        thread_name = message.get("thread", {}).get("name", "")
 
-        if not text:
+        if self.routing_mode == "bridge":
+            if not space_name or not text:
+                return "ignored_empty"
+            if self.gchat_space_id and space_name != self.gchat_space_id:
+                return "ignored_foreign_space"
+            if msg_name:
+                self.db.mark_processed(f"gc:{msg_name}")
+            if text.startswith("!"):
+                return "ignored_internal_note"
+            if self.tg_chat_id is None:
+                return "ignored_unknown_thread"
+            self.tg.send_message(self.tg_chat_id, text)
+            return "forwarded_to_telegram"
+
+        route_key = space_name if self.routing_mode == "space" else thread_name
+        if not route_key or not text:
             return "ignored_empty"
 
         if msg_name:
             self.db.mark_processed(f"gc:{msg_name}")
 
-        # Сообщения, начинающиеся с '!', считаются внутренними заметками
+        # Internal operator notes starting with '!' stay inside Google Chat
         if text.startswith("!"):
             return "ignored_internal_note"
 
-        tg_chat_id = self.target_tg_chat_id
-        if tg_chat_id is None:
-            lookup_space = space_name or self.gchat_space_id
-            if lookup_space:
-                tg_chat_id = self.db.get_tg_by_space(lookup_space)
+        tg_chat_id = self.db.get_tg_by_thread(route_key)
+        if not tg_chat_id:
+            return "ignored_unknown_thread"
 
-        if tg_chat_id is None:
-            return "ignored_unknown_chat"
+        if text == "/close":
+            self.db.close_thread(route_key)
+            self.tg.send_message(tg_chat_id, "Обращение закрыто оператором поддержки.")
+            if self.routing_mode == "space":
+                self.gchat.send_message(text="Диалог закрыт.", space_name=route_key)
+            else:
+                self.gchat.send_message(text="Диалог закрыт.", thread_name=route_key)
+            return "closed"
 
         self.tg.send_message(tg_chat_id, text)
         return "forwarded_to_telegram"

@@ -16,11 +16,14 @@ class StateDB:
     def _init_schema(self) -> None:
         with self._lock:
             cur = self._conn.cursor()
+            if self.db_path != ":memory:":
+                cur.execute("PRAGMA journal_mode=WAL;")
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS space_bindings (
-                    gchat_space_id TEXT PRIMARY KEY,
-                    tg_chat_id INTEGER NOT NULL,
+                CREATE TABLE IF NOT EXISTS threads (
+                    tg_chat_id INTEGER PRIMARY KEY,
+                    gchat_thread_name TEXT UNIQUE NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -33,32 +36,62 @@ class StateDB:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kv_store (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
             self._conn.commit()
 
-    def bind_space(self, gchat_space_id: str, tg_chat_id: int) -> None:
+    def get_thread_by_tg(self, tg_chat_id: int) -> Optional[str]:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT gchat_thread_name FROM threads WHERE tg_chat_id = ? AND status = 'open'",
+                (tg_chat_id,),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def get_tg_by_thread(self, gchat_thread_name: str) -> Optional[int]:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT tg_chat_id FROM threads WHERE gchat_thread_name = ?",
+                (gchat_thread_name,),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def upsert_thread(self, tg_chat_id: int, gchat_thread_name: str) -> None:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
                 """
-                INSERT INTO space_bindings (gchat_space_id, tg_chat_id, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(gchat_space_id) DO UPDATE SET
-                    tg_chat_id = excluded.tg_chat_id,
+                INSERT INTO threads (tg_chat_id, gchat_thread_name, status, updated_at)
+                VALUES (?, ?, 'open', CURRENT_TIMESTAMP)
+                ON CONFLICT(tg_chat_id) DO UPDATE SET
+                    gchat_thread_name = excluded.gchat_thread_name,
+                    status = 'open',
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (gchat_space_id, tg_chat_id),
+                (tg_chat_id, gchat_thread_name),
             )
             self._conn.commit()
 
-    def get_tg_by_space(self, gchat_space_id: str) -> Optional[int]:
+    def close_thread(self, gchat_thread_name: str) -> None:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
-                "SELECT tg_chat_id FROM space_bindings WHERE gchat_space_id = ?",
-                (gchat_space_id,),
+                "UPDATE threads SET status = 'closed', updated_at = CURRENT_TIMESTAMP "
+                "WHERE gchat_thread_name = ?",
+                (gchat_thread_name,),
             )
-            row = cur.fetchone()
-            return row[0] if row else None
+            self._conn.commit()
 
     def is_processed(self, msg_id: str) -> bool:
         with self._lock:
@@ -74,3 +107,40 @@ class StateDB:
                 (msg_id,),
             )
             self._conn.commit()
+
+    def cleanup_processed_messages(self, retention_days: int = 7) -> int:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "DELETE FROM processed_messages WHERE created_at < datetime('now', ?)",
+                (f"-{retention_days} days",),
+            )
+            deleted = cur.rowcount
+            self._conn.commit()
+            return deleted
+
+    def get_tg_offset(self) -> int:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("SELECT value FROM kv_store WHERE key = 'tg_offset'")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+
+    def set_tg_offset(self, offset: int) -> None:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO kv_store (key, value, updated_at)
+                VALUES ('tg_offset', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (str(offset),),
+            )
+            self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()

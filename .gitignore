@@ -28,3 +28,9 @@ data/
 .idea/
 Thumbs.db
 *.log
+
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfvars
+!terraform/terraform.tfvars.example

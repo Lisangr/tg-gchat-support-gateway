@@ -1,0 +1,5 @@
+project_id         = "my-gcp-project-id"
+region             = "europe-central2"
+topic_name         = "support-gateway-events"
+subscription_name  = "support-gateway-sub"
+service_account_id = "support-gateway-bot"

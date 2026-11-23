@@ -1,0 +1,28 @@
+services:
+  gateway:
+    build: .
+    container_name: support-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/secrets/google-sa.json
+      - DB_PATH=/app/data/gateway.db
+    volumes:
+      - ./secrets/google-sa.json:/app/secrets/google-sa.json:ro
+      - gateway_data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, time; p='/tmp/gateway_alive'; assert os.path.exists(p) and (time.time() - os.path.getmtime(p)) < 60"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  gateway_data:

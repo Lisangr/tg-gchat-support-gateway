@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest и отчёты покрытия (служебный мусор от тестов)
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+
+# Секреты, конфиги и база SQLite
+.env
+.env.*
+!.env.example
+secrets/
+data/
+*.db
+*.db-*
+
+# IDE и мусор Windows
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+*.log
